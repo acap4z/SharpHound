@@ -1,8 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.Linq;
-using System.Net.Configuration;
-using System.Runtime.Remoting;
+using System.Net;
+using System.Runtime.Remoting.Contexts;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading;
 using System.Threading.Channels;
@@ -28,7 +29,7 @@ namespace Sharphound.Runtime {
         private readonly ComputerSessionProcessor _computerSessionProcessor;
         private readonly ContainerProcessor _containerProcessor;
         private readonly IContext _context;
-        private readonly DCRegistryProcessor _dCRegistryProcessor;
+        private readonly DCRegistryProcessor _dcRegistryProcessor;
         private readonly DomainTrustProcessor _domainTrustProcessor;
         private readonly GroupProcessor _groupProcessor;
         private readonly LdapPropertyProcessor _ldapPropertyProcessor;
@@ -38,6 +39,8 @@ namespace Sharphound.Runtime {
         private readonly ILogger _log;
         private readonly CollectionMethod _methods;
         private readonly SPNProcessors _spnProcessor;
+        private readonly WebClientServiceProcessor _webClientProcessor;
+        private readonly SmbProcessor _smbProcessor;
 
         public ObjectProcessors(IContext context, ILogger log) {
             _context = context;
@@ -48,7 +51,7 @@ namespace Sharphound.Runtime {
             _computerAvailability = new ComputerAvailability(context.PortScanTimeout,
                 skipPortScan: context.Flags.SkipPortScan, skipPasswordCheck: context.Flags.SkipPasswordAgeCheck);
             _certAbuseProcessor = new CertAbuseProcessor(context.LDAPUtils);
-            _dCRegistryProcessor = new DCRegistryProcessor(context.LDAPUtils);
+            _dcRegistryProcessor = new DCRegistryProcessor(context.LDAPUtils);
             _computerSessionProcessor = new ComputerSessionProcessor(context.LDAPUtils,
                 doLocalAdminSessionEnum: context.Flags.DoLocalAdminSessionEnum,
                 localAdminUsername: context.LocalAdminUsername, localAdminPassword: context.LocalAdminPassword);
@@ -57,6 +60,8 @@ namespace Sharphound.Runtime {
             _gpoLocalGroupProcessor = new GPOLocalGroupProcessor(context.LDAPUtils);
             _userRightsAssignmentProcessor = new UserRightsAssignmentProcessor(context.LDAPUtils);
             _localGroupProcessor = new LocalGroupProcessor(context.LDAPUtils);
+            _webClientProcessor = new WebClientServiceProcessor(log);
+            _smbProcessor = new SmbProcessor(context.PortScanTimeout);
             _methods = context.ResolvedCollectionMethods;
             _cancellationToken = context.CancellationTokenSource.Token;
             _log = log;
@@ -116,8 +121,7 @@ namespace Sharphound.Runtime {
 
             return props;
         }
-        
-        
+
 
         private async Task<User> ProcessUserObject(IDirectoryObject entry,
             ResolvedSearchResult resolvedSearchResult) {
@@ -125,14 +129,16 @@ namespace Sharphound.Runtime {
                 ObjectIdentifier = resolvedSearchResult.ObjectId
             };
 
-            ret.Properties = new Dictionary<string, object>(GetCommonProperties(entry, resolvedSearchResult));
-            ret.Properties.Add("samaccountname", entry.GetProperty(LDAPProperties.SAMAccountName));
+            ret.Properties = new Dictionary<string, object>(GetCommonProperties(entry, resolvedSearchResult)) {
+                { "samaccountname", entry.GetProperty(LDAPProperties.SAMAccountName) }
+            };
             if (entry.IsMSA()) ret.Properties.Add("msa", true);
             if (entry.IsGMSA()) ret.Properties.Add("gmsa", true);
             ret.DomainSID = resolvedSearchResult.DomainSid;
 
-            if ((_methods & CollectionMethod.ACL) != 0) {
-                (var aces, bool doesAnyAceGrantOwnerRights, bool doesAnyInheritedAceGrantOwnerRights) = await _aclProcessor.ProcessACL(resolvedSearchResult, entry, true);
+            if (_methods.HasFlag(CollectionMethod.ACL)) {
+                var (aces, doesAnyAceGrantOwnerRights, doesAnyInheritedAceGrantOwnerRights) =
+                    await _aclProcessor.ProcessACL(resolvedSearchResult, entry, true);
                 ret.Properties.Add("doesanyacegrantownerrights", doesAnyAceGrantOwnerRights);
                 ret.Properties.Add("doesanyinheritedacegrantownerrights", doesAnyInheritedAceGrantOwnerRights);
                 var gmsa = entry.GetByteProperty(LDAPProperties.GroupMSAMembership);
@@ -142,12 +148,12 @@ namespace Sharphound.Runtime {
                 ret.Properties.Add("isaclprotected", ret.IsACLProtected);
             }
 
-            if ((_methods & CollectionMethod.Group) != 0) {
+            if (_methods.HasFlag(CollectionMethod.Group)) {
                 var pg = entry.GetProperty(LDAPProperties.PrimaryGroupID);
                 ret.PrimaryGroupSID = GroupProcessor.GetPrimaryGroupInfo(pg, resolvedSearchResult.ObjectId);
             }
 
-            if ((_methods & CollectionMethod.ObjectProps) != 0) {
+            if (_methods.HasFlag(CollectionMethod.ObjectProps)) {
                 var userProps = await _ldapPropertyProcessor.ReadUserProperties(entry, resolvedSearchResult);
                 ret.Properties = ContextUtils.Merge(ret.Properties, userProps.Props);
                 if (_context.Flags.CollectAllProperties) {
@@ -160,12 +166,12 @@ namespace Sharphound.Runtime {
                 ret.UnconstrainedDelegation = userProps.UnconstrainedDelegation;
             }
 
-            if ((_methods & CollectionMethod.SPNTargets) != 0) {
+            if (_methods.HasFlag(CollectionMethod.SPNTargets)) {
                 ret.SPNTargets = await _spnProcessor.ReadSPNTargets(resolvedSearchResult, entry)
                     .ToArrayAsync(cancellationToken: _cancellationToken);
             }
 
-            if ((_methods & CollectionMethod.Container) != 0) {
+            if (_methods.HasFlag(CollectionMethod.Container)) {
                 if (entry.TryGetDistinguishedName(out var dn) &&
                     await _containerProcessor.GetContainingObject(dn) is (true, var container)) {
                     ret.ContainedBy = container;
@@ -175,34 +181,40 @@ namespace Sharphound.Runtime {
             return ret;
         }
 
-        private async Task<Computer> ProcessComputerObject(IDirectoryObject entry,
-            ResolvedSearchResult resolvedSearchResult, Channel<CSVComputerStatus> compStatusChannel) {
+        private async Task<Computer> ProcessComputerObject(
+            IDirectoryObject entry,
+            ResolvedSearchResult resolvedSearchResult,
+            Channel<CSVComputerStatus> compStatusChannel
+        ) {
             var ret = new Computer {
-                ObjectIdentifier = resolvedSearchResult.ObjectId
+                ObjectIdentifier = resolvedSearchResult.ObjectId,
+                Properties = new Dictionary<string, object>(GetCommonProperties(entry, resolvedSearchResult))
             };
 
-            ret.Properties = new Dictionary<string, object>(GetCommonProperties(entry, resolvedSearchResult));
-            ret.Properties.Add("samaccountname", entry.GetProperty(LDAPProperties.SAMAccountName));
+            var samAccountName = entry.GetProperty(LDAPProperties.SAMAccountName);
+            ret.Properties.Add("samaccountname", samAccountName);
 
             var hasLaps = entry.HasLAPS();
             ret.Properties.Add("haslaps", hasLaps);
             ret.IsDC = resolvedSearchResult.IsDomainController;
             ret.DomainSID = resolvedSearchResult.DomainSid;
 
-            if ((_methods & CollectionMethod.ACL) != 0) {
-                (ret.Aces, bool doesAnyAceGrantOwnerRights, bool doesAnyInheritedAceGrantOwnerRights) = await _aclProcessor.ProcessACL(resolvedSearchResult, entry, true);
+            if (_methods.HasFlag(CollectionMethod.ACL)) {
+                var (aces, doesAnyAceGrantOwnerRights, doesAnyInheritedAceGrantOwnerRights) =
+                    await _aclProcessor.ProcessACL(resolvedSearchResult, entry, true);
                 ret.Properties.Add("doesanyacegrantownerrights", doesAnyAceGrantOwnerRights);
                 ret.Properties.Add("doesanyinheritedacegrantownerrights", doesAnyInheritedAceGrantOwnerRights);
+                ret.Aces = aces;
                 ret.IsACLProtected = _aclProcessor.IsACLProtected(entry);
                 ret.Properties.Add("isaclprotected", ret.IsACLProtected);
             }
 
-            if ((_methods & CollectionMethod.Group) != 0) {
+            if (_methods.HasFlag(CollectionMethod.Group)) {
                 var pg = entry.GetProperty(LDAPProperties.PrimaryGroupID);
                 ret.PrimaryGroupSID = GroupProcessor.GetPrimaryGroupInfo(pg, resolvedSearchResult.ObjectId);
             }
 
-            if ((_methods & CollectionMethod.ObjectProps) != 0) {
+            if (_methods.HasFlag(CollectionMethod.ObjectProps)) {
                 var computerProps = await _ldapPropertyProcessor.ReadComputerProperties(entry, resolvedSearchResult);
                 ret.Properties = ContextUtils.Merge(ret.Properties, computerProps.Props);
                 if (_context.Flags.CollectAllProperties) {
@@ -217,14 +229,14 @@ namespace Sharphound.Runtime {
                 ret.UnconstrainedDelegation = computerProps.UnconstrainedDelegation;
             }
 
-            if ((_methods & CollectionMethod.Container) != 0) {
+            if (_methods.HasFlag(CollectionMethod.Container)) {
                 if (entry.TryGetDistinguishedName(out var dn) &&
                     await _containerProcessor.GetContainingObject(dn) is (true, var container)) {
                     ret.ContainedBy = container;
                 }
             }
 
-            if (!_methods.IsComputerCollectionSet())
+            if (!(_methods.IsComputerCollectionSet() || _methods.HasFlag(CollectionMethod.LdapServices)))
                 return ret;
 
             var apiName = _context.RealDNSName != null
@@ -240,21 +252,12 @@ namespace Sharphound.Runtime {
                 return ret;
             }
 
-            // DCRegistry
-            if (resolvedSearchResult.IsDomainController &
-                (_methods & CollectionMethod.DCRegistry) != 0) {
-                DCRegistryData dCRegistryData = new() {
-                    CertificateMappingMethods = _dCRegistryProcessor.GetCertificateMappingMethods(apiName),
-                    StrongCertificateBindingEnforcement =
-                        _dCRegistryProcessor.GetStrongCertificateBindingEnforcement(apiName)
-                };
+            if (resolvedSearchResult.IsDomainController)
+                ProcessDomainController(resolvedSearchResult, ret, apiName);
 
-                ret.DCRegistryData = dCRegistryData;
-            }
+            var trimmedSamAccountName = samAccountName?.TrimEnd('$');
 
-            var samAccountName = entry.GetProperty(LDAPProperties.SAMAccountName)?.TrimEnd('$');
-
-            if ((_methods & CollectionMethod.Session) != 0) {
+            if (_methods.HasFlag(CollectionMethod.Session)) {
                 await _context.DoDelay();
                 var sessionResult = await _computerSessionProcessor.ReadUserSessions(apiName,
                     resolvedSearchResult.ObjectId, resolvedSearchResult.Domain);
@@ -267,10 +270,10 @@ namespace Sharphound.Runtime {
                     }, _cancellationToken);
             }
 
-            if ((_methods & CollectionMethod.LoggedOn) != 0) {
+            if (_methods.HasFlag(CollectionMethod.LoggedOn)) {
                 await _context.DoDelay();
                 var privSessionResult = await _computerSessionProcessor.ReadUserSessionsPrivileged(
-                    resolvedSearchResult.DisplayName, samAccountName,
+                    resolvedSearchResult.DisplayName, trimmedSamAccountName,
                     resolvedSearchResult.ObjectId);
                 ret.PrivilegedSessions = privSessionResult;
 
@@ -295,13 +298,43 @@ namespace Sharphound.Runtime {
                 }
             }
 
-            if ((_methods & CollectionMethod.UserRights) != 0) {
+            if (_methods.HasFlag(CollectionMethod.UserRights)) {
                 await _context.DoDelay();
                 var userRights = _userRightsAssignmentProcessor.GetUserRightsAssignments(
                     resolvedSearchResult.DisplayName, resolvedSearchResult.ObjectId,
                     resolvedSearchResult.Domain, resolvedSearchResult.IsDomainController);
                 ret.UserRights = await userRights.ToArrayAsync();
             }
+
+            if (_methods.HasFlag(CollectionMethod.WebClientService)) {
+                ret.IsWebClientRunning = await _webClientProcessor.IsWebClientRunning(apiName);
+            }
+
+            if (_methods.HasFlag(CollectionMethod.SmbInfo)) {
+                ret.SmbInfo = await _smbProcessor.Scan(apiName);
+            }
+
+            // Re-introduce this when we're ready for Event Log collection
+            // if (_methods.HasFlag(CollectionMethod.EventLogs))
+            // {
+            //     var cred = _context.Flags.DoLocalAdminSessionEnum
+            //         ? new NetworkCredential(_context.LocalAdminUsername, _context.LocalAdminPassword, ".")
+            //         : null;
+            //     
+            //     var evntProcessor = new EventLogProcessor(
+            //         _context.LDAPUtils,
+            //         _log,
+            //         apiName,
+            //         resolvedSearchResult.Domain,
+            //         EventLogCollection.InboundNtlmSessions,
+            //         numDays: 7,
+            //         readEventDelayMs: 1,
+            //         10000,
+            //         cred
+            //     );
+            //
+            //     ret.NtlmSessions = evntProcessor.ReadEvents();
+            // }
 
             if (!_methods.IsLocalGroupCollectionSet())
                 return ret;
@@ -315,6 +348,26 @@ namespace Sharphound.Runtime {
             return ret;
         }
 
+        private async void ProcessDomainController(ResolvedSearchResult resolvedSearchResult, Computer ret,
+            string apiName) {
+            _log.LogDebug("Processing DC: {dc}", apiName);
+
+            if (_methods.HasFlag(CollectionMethod.DCRegistry)) {
+                DCRegistryData dCRegistryData = new() {
+                    CertificateMappingMethods = _dcRegistryProcessor.GetCertificateMappingMethods(apiName),
+                    StrongCertificateBindingEnforcement =
+                        _dcRegistryProcessor.GetStrongCertificateBindingEnforcement(apiName)
+                };
+
+                ret.DCRegistryData = dCRegistryData;
+            }
+
+            if (_methods.HasFlag(CollectionMethod.LdapServices)) {
+                var dcLdapProcessor = new DCLdapProcessor(_context.PortScanTimeout, apiName, _log);
+                ret.LdapServices = await dcLdapProcessor.Scan();
+            }
+        }
+
         private async Task<Group> ProcessGroupObject(IDirectoryObject entry,
             ResolvedSearchResult resolvedSearchResult) {
             var ret = new Group {
@@ -324,20 +377,22 @@ namespace Sharphound.Runtime {
             ret.Properties = new Dictionary<string, object>(GetCommonProperties(entry, resolvedSearchResult));
             ret.Properties.Add("samaccountname", entry.GetProperty(LDAPProperties.SAMAccountName));
 
-            if ((_methods & CollectionMethod.ACL) != 0) {
-                (ret.Aces, bool doesAnyAceGrantOwnerRights, bool doesAnyInheritedAceGrantOwnerRights) = await _aclProcessor.ProcessACL(resolvedSearchResult, entry, true);
+            if (_methods.HasFlag(CollectionMethod.ACL)) {
+                var (aces, doesAnyAceGrantOwnerRights, doesAnyInheritedAceGrantOwnerRights) =
+                    await _aclProcessor.ProcessACL(resolvedSearchResult, entry, true);
                 ret.Properties.Add("doesanyacegrantownerrights", doesAnyAceGrantOwnerRights);
                 ret.Properties.Add("doesanyinheritedacegrantownerrights", doesAnyInheritedAceGrantOwnerRights);
+                ret.Aces = aces;
                 ret.IsACLProtected = _aclProcessor.IsACLProtected(entry);
                 ret.Properties.Add("isaclprotected", ret.IsACLProtected);
             }
 
-            if ((_methods & CollectionMethod.Group) != 0)
+            if (_methods.HasFlag(CollectionMethod.Group))
                 ret.Members = await _groupProcessor
                     .ReadGroupMembers(resolvedSearchResult, entry)
                     .ToArrayAsync(cancellationToken: _cancellationToken);
 
-            if ((_methods & CollectionMethod.ObjectProps) != 0) {
+            if (_methods.HasFlag(CollectionMethod.ObjectProps)) {
                 var groupProps = LdapPropertyProcessor.ReadGroupProperties(entry);
                 ret.Properties = ContextUtils.Merge(ret.Properties, groupProps);
                 if (_context.Flags.CollectAllProperties) {
@@ -346,7 +401,7 @@ namespace Sharphound.Runtime {
                 }
             }
 
-            if ((_methods & CollectionMethod.Container) != 0) {
+            if (_methods.HasFlag(CollectionMethod.Container)) {
                 if (entry.TryGetDistinguishedName(out var dn) &&
                     await _containerProcessor.GetContainingObject(dn) is (true, var container)) {
                     ret.ContainedBy = container;
@@ -361,15 +416,18 @@ namespace Sharphound.Runtime {
             var ret = new Domain {
                 ObjectIdentifier = resolvedSearchResult.ObjectId
             };
-            
-            if (await _context.LDAPUtils.GetForest(resolvedSearchResult.DisplayName) is (true, var forest) && await _context.LDAPUtils.GetDomainSidFromDomainName(forest) is (true, var forestSid)) {
+
+            if (await _context.LDAPUtils.GetForest(resolvedSearchResult.DisplayName) is (true, var forest) &&
+                await _context.LDAPUtils.GetDomainSidFromDomainName(forest) is (true, var forestSid)) {
                 ret.ForestRootIdentifier = forestSid;
             }
 
             ret.Properties = new Dictionary<string, object>(GetCommonProperties(entry, resolvedSearchResult));
 
-            if ((_methods & CollectionMethod.ACL) != 0) {
-                (ret.Aces, bool doesAnyAceGrantOwnerRights, bool doesAnyInheritedAceGrantOwnerRights) = await _aclProcessor.ProcessACL(resolvedSearchResult, entry, true);
+            if (_methods.HasFlag(CollectionMethod.ACL)) {
+                var (aces, doesAnyAceGrantOwnerRights, doesAnyInheritedAceGrantOwnerRights) =
+                    await _aclProcessor.ProcessACL(resolvedSearchResult, entry, true);
+                ret.Aces = aces;
                 ret.Properties.Add("doesanyacegrantownerrights", doesAnyAceGrantOwnerRights);
                 ret.Properties.Add("doesanyinheritedacegrantownerrights", doesAnyInheritedAceGrantOwnerRights);
                 ret.IsACLProtected = _aclProcessor.IsACLProtected(entry);
@@ -377,23 +435,24 @@ namespace Sharphound.Runtime {
                 ret.InheritanceHashes = _aclProcessor.GetInheritedAceHashes(entry, resolvedSearchResult).ToArray();
             }
 
-            if ((_methods & CollectionMethod.Trusts) != 0)
+            if (_methods.HasFlag(CollectionMethod.Trusts))
                 ret.Trusts = await _domainTrustProcessor.EnumerateDomainTrusts(resolvedSearchResult.Domain)
                     .ToArrayAsync();
 
-            if ((_methods & CollectionMethod.ObjectProps) != 0) {
-                ret.Properties = ContextUtils.Merge(ret.Properties, await _ldapPropertyProcessor.ReadDomainProperties(entry, resolvedSearchResult.Domain));
+            if (_methods.HasFlag(CollectionMethod.ObjectProps)) {
+                ret.Properties = ContextUtils.Merge(ret.Properties,
+                    await _ldapPropertyProcessor.ReadDomainProperties(entry, resolvedSearchResult.Domain));
                 if (_context.Flags.CollectAllProperties) {
                     ret.Properties = ContextUtils.Merge(_ldapPropertyProcessor.ParseAllProperties(entry),
                         ret.Properties);
                 }
             }
 
-            if ((_methods & CollectionMethod.Container) != 0) {
+            if (_methods.HasFlag(CollectionMethod.Container)) {
                 ret.Links = await _containerProcessor.ReadContainerGPLinks(resolvedSearchResult, entry).ToArrayAsync();
             }
 
-            if ((_methods & CollectionMethod.GPOLocalGroup) != 0) {
+            if (_methods.HasFlag(CollectionMethod.GPOLocalGroup)) {
                 ret.GPOChanges = await _gpoLocalGroupProcessor.ReadGPOLocalGroups(entry);
             }
 
@@ -408,15 +467,17 @@ namespace Sharphound.Runtime {
 
             ret.Properties = new Dictionary<string, object>(GetCommonProperties(entry, resolvedSearchResult));
 
-            if ((_methods & CollectionMethod.ACL) != 0) {
-                (ret.Aces, bool doesAnyAceGrantOwnerRights, bool doesAnyInheritedAceGrantOwnerRights) = await _aclProcessor.ProcessACL(resolvedSearchResult, entry, true);
+            if (_methods.HasFlag(CollectionMethod.ACL)) {
+                var (aces, doesAnyAceGrantOwnerRights, doesAnyInheritedAceGrantOwnerRights) =
+                    await _aclProcessor.ProcessACL(resolvedSearchResult, entry, true);
                 ret.Properties.Add("doesanyacegrantownerrights", doesAnyAceGrantOwnerRights);
                 ret.Properties.Add("doesanyinheritedacegrantownerrights", doesAnyInheritedAceGrantOwnerRights);
+                ret.Aces = aces;
                 ret.IsACLProtected = _aclProcessor.IsACLProtected(entry);
                 ret.Properties.Add("isaclprotected", ret.IsACLProtected);
             }
 
-            if ((_methods & CollectionMethod.ObjectProps) != 0) {
+            if (_methods.HasFlag(CollectionMethod.ObjectProps)) {
                 ret.Properties = ContextUtils.Merge(ret.Properties, LdapPropertyProcessor.ReadGPOProperties(entry));
                 if (_context.Flags.CollectAllProperties) {
                     ret.Properties = ContextUtils.Merge(_ldapPropertyProcessor.ParseAllProperties(entry),
@@ -435,16 +496,18 @@ namespace Sharphound.Runtime {
 
             ret.Properties = new Dictionary<string, object>(GetCommonProperties(entry, resolvedSearchResult));
 
-            if ((_methods & CollectionMethod.ACL) != 0) {
-                (ret.Aces, bool doesAnyAceGrantOwnerRights, bool doesAnyInheritedAceGrantOwnerRights) = await _aclProcessor.ProcessACL(resolvedSearchResult, entry, true);
+            if (_methods.HasFlag(CollectionMethod.ACL)) {
+                var (aces, doesAnyAceGrantOwnerRights, doesAnyInheritedAceGrantOwnerRights) =
+                    await _aclProcessor.ProcessACL(resolvedSearchResult, entry, true);
                 ret.Properties.Add("doesanyacegrantownerrights", doesAnyAceGrantOwnerRights);
                 ret.Properties.Add("doesanyinheritedacegrantownerrights", doesAnyInheritedAceGrantOwnerRights);
+                ret.Aces = aces;
                 ret.IsACLProtected = _aclProcessor.IsACLProtected(entry);
                 ret.Properties.Add("isaclprotected", ret.IsACLProtected);
                 ret.InheritanceHashes = _aclProcessor.GetInheritedAceHashes(entry, resolvedSearchResult).ToArray();
             }
 
-            if ((_methods & CollectionMethod.ObjectProps) != 0) {
+            if (_methods.HasFlag(CollectionMethod.ObjectProps)) {
                 ret.Properties = ContextUtils.Merge(ret.Properties, LdapPropertyProcessor.ReadOUProperties(entry));
                 if (_context.Flags.CollectAllProperties) {
                     ret.Properties = ContextUtils.Merge(_ldapPropertyProcessor.ParseAllProperties(entry),
@@ -452,7 +515,7 @@ namespace Sharphound.Runtime {
                 }
             }
 
-            if ((_methods & CollectionMethod.Container) != 0) {
+            if (_methods.HasFlag(CollectionMethod.Container)) {
                 if (await _containerProcessor.GetContainingObject(entry) is (true, var container)) {
                     ret.ContainedBy = container;
                 }
@@ -462,7 +525,7 @@ namespace Sharphound.Runtime {
                 ret.Links = await _containerProcessor.ReadContainerGPLinks(resolvedSearchResult, entry).ToArrayAsync();
             }
 
-            if ((_methods & CollectionMethod.GPOLocalGroup) != 0) {
+            if (_methods.HasFlag(CollectionMethod.GPOLocalGroup)) {
                 ret.GPOChanges = await _gpoLocalGroupProcessor.ReadGPOLocalGroups(entry);
             }
 
@@ -478,21 +541,23 @@ namespace Sharphound.Runtime {
 
             ret.Properties = new Dictionary<string, object>(GetCommonProperties(entry, resolvedSearchResult));
 
-            if ((_methods & CollectionMethod.Container) != 0 || (_methods & CollectionMethod.CertServices) != 0)
+            if (_methods.HasFlag(CollectionMethod.Container) || _methods.HasFlag(CollectionMethod.CertServices))
                 if (await _containerProcessor.GetContainingObject(entry) is (true, var container)) {
                     ret.ContainedBy = container;
                 }
 
-            if ((_methods & CollectionMethod.ACL) != 0 || (_methods & CollectionMethod.CertServices) != 0) {
-                (ret.Aces, bool doesAnyAceGrantOwnerRights, bool doesAnyInheritedAceGrantOwnerRights) = await _aclProcessor.ProcessACL(resolvedSearchResult, entry, true);
+            if (_methods.HasFlag(CollectionMethod.ACL) || _methods.HasFlag(CollectionMethod.CertServices)) {
+                var (aces, doesAnyAceGrantOwnerRights, doesAnyInheritedAceGrantOwnerRights) =
+                    await _aclProcessor.ProcessACL(resolvedSearchResult, entry, true);
                 ret.Properties.Add("doesanyacegrantownerrights", doesAnyAceGrantOwnerRights);
                 ret.Properties.Add("doesanyinheritedacegrantownerrights", doesAnyInheritedAceGrantOwnerRights);
+                ret.Aces = aces;
                 ret.IsACLProtected = _aclProcessor.IsACLProtected(entry);
                 ret.Properties.Add("isaclprotected", ret.IsACLProtected);
                 ret.InheritanceHashes = _aclProcessor.GetInheritedAceHashes(entry, resolvedSearchResult).ToArray();
             }
 
-            if ((_methods & CollectionMethod.ObjectProps) != 0 || (_methods & CollectionMethod.CertServices) != 0) {
+            if (_methods.HasFlag(CollectionMethod.ObjectProps) || _methods.HasFlag(CollectionMethod.CertServices)) {
                 ret.Properties =
                     ContextUtils.Merge(LdapPropertyProcessor.ReadContainerProperties(entry), ret.Properties);
                 if (_context.Flags.CollectAllProperties) {
@@ -514,20 +579,22 @@ namespace Sharphound.Runtime {
             ret.Properties = new Dictionary<string, object>(GetCommonProperties(entry, resolvedSearchResult));
 
 
-            if ((_methods & CollectionMethod.ACL) != 0 || (_methods & CollectionMethod.CertServices) != 0) {
-                (ret.Aces, bool doesAnyAceGrantOwnerRights, bool doesAnyInheritedAceGrantOwnerRights) = await _aclProcessor.ProcessACL(resolvedSearchResult, entry, true);
+            if (_methods.HasFlag(CollectionMethod.ACL) || _methods.HasFlag(CollectionMethod.CertServices)) {
+                var (aces, doesAnyAceGrantOwnerRights, doesAnyInheritedAceGrantOwnerRights) =
+                    await _aclProcessor.ProcessACL(resolvedSearchResult, entry, true);
                 ret.Properties.Add("doesanyacegrantownerrights", doesAnyAceGrantOwnerRights);
                 ret.Properties.Add("doesanyinheritedacegrantownerrights", doesAnyInheritedAceGrantOwnerRights);
+                ret.Aces = aces;
                 ret.IsACLProtected = _aclProcessor.IsACLProtected(entry);
                 ret.Properties.Add("isaclprotected", ret.IsACLProtected);
             }
 
-            if ((_methods & CollectionMethod.ObjectProps) != 0 || (_methods & CollectionMethod.CertServices) != 0) {
+            if (_methods.HasFlag(CollectionMethod.ObjectProps) || _methods.HasFlag(CollectionMethod.CertServices)) {
                 var props = LdapPropertyProcessor.ReadRootCAProperties(entry);
                 ret.Properties.Merge(props);
             }
 
-            if ((_methods & CollectionMethod.Container) != 0 || (_methods & CollectionMethod.CertServices) != 0) {
+            if (_methods.HasFlag(CollectionMethod.Container) || _methods.HasFlag(CollectionMethod.CertServices)) {
                 if (await _containerProcessor.GetContainingObject(entry) is (true, var container)) {
                     ret.ContainedBy = container;
                 }
@@ -543,20 +610,22 @@ namespace Sharphound.Runtime {
 
             ret.Properties = new Dictionary<string, object>(GetCommonProperties(entry, resolvedSearchResult));
 
-            if ((_methods & CollectionMethod.ACL) != 0 || (_methods & CollectionMethod.CertServices) != 0) {
-                (ret.Aces, bool doesAnyAceGrantOwnerRights, bool doesAnyInheritedAceGrantOwnerRights) = await _aclProcessor.ProcessACL(resolvedSearchResult, entry, true);
+            if (_methods.HasFlag(CollectionMethod.ACL) || _methods.HasFlag(CollectionMethod.CertServices)) {
+                var (aces, doesAnyAceGrantOwnerRights, doesAnyInheritedAceGrantOwnerRights) =
+                    await _aclProcessor.ProcessACL(resolvedSearchResult, entry, true);
                 ret.Properties.Add("doesanyacegrantownerrights", doesAnyAceGrantOwnerRights);
                 ret.Properties.Add("doesanyinheritedacegrantownerrights", doesAnyInheritedAceGrantOwnerRights);
+                ret.Aces = aces;
                 ret.IsACLProtected = _aclProcessor.IsACLProtected(entry);
                 ret.Properties.Add("isaclprotected", ret.IsACLProtected);
             }
 
-            if ((_methods & CollectionMethod.ObjectProps) != 0 || (_methods & CollectionMethod.CertServices) != 0) {
+            if (_methods.HasFlag(CollectionMethod.ObjectProps) || _methods.HasFlag(CollectionMethod.CertServices)) {
                 var props = LdapPropertyProcessor.ReadAIACAProperties(entry);
                 ret.Properties.Merge(props);
             }
 
-            if ((_methods & CollectionMethod.Container) != 0 || (_methods & CollectionMethod.CertServices) != 0) {
+            if (_methods.HasFlag(CollectionMethod.Container) || _methods.HasFlag(CollectionMethod.CertServices)) {
                 if (await _containerProcessor.GetContainingObject(entry) is (true, var container)) {
                     ret.ContainedBy = container;
                 }
@@ -569,19 +638,20 @@ namespace Sharphound.Runtime {
             ResolvedSearchResult resolvedSearchResult) {
             var ret = new EnterpriseCA {
                 ObjectIdentifier = resolvedSearchResult.ObjectId,
+                Properties = new Dictionary<string, object>(GetCommonProperties(entry, resolvedSearchResult))
             };
 
-            ret.Properties = new Dictionary<string, object>(GetCommonProperties(entry, resolvedSearchResult));
-
-            if ((_methods & CollectionMethod.ACL) != 0 || (_methods & CollectionMethod.CertServices) != 0) {
-                (ret.Aces, bool doesAnyAceGrantOwnerRights, bool doesAnyInheritedAceGrantOwnerRights) = await _aclProcessor.ProcessACL(resolvedSearchResult, entry, true);
+            if (_methods.HasFlag(CollectionMethod.ACL) || _methods.HasFlag(CollectionMethod.CertServices)) {
+                var (aces, doesAnyAceGrantOwnerRights, doesAnyInheritedAceGrantOwnerRights) =
+                    await _aclProcessor.ProcessACL(resolvedSearchResult, entry, true);
                 ret.Properties.Add("doesanyacegrantownerrights", doesAnyAceGrantOwnerRights);
                 ret.Properties.Add("doesanyinheritedacegrantownerrights", doesAnyInheritedAceGrantOwnerRights);
+                ret.Aces = aces;
                 ret.IsACLProtected = _aclProcessor.IsACLProtected(entry);
                 ret.Properties.Add("isaclprotected", ret.IsACLProtected);
             }
 
-            if ((_methods & CollectionMethod.ObjectProps) != 0 || (_methods & CollectionMethod.CertServices) != 0) {
+            if (_methods.HasFlag(CollectionMethod.ObjectProps) || _methods.HasFlag(CollectionMethod.CertServices)) {
                 var props = LdapPropertyProcessor.ReadEnterpriseCAProperties(entry);
                 ret.Properties.Merge(props);
 
@@ -594,13 +664,26 @@ namespace Sharphound.Runtime {
                 }
             }
 
-            if ((_methods & CollectionMethod.Container) != 0 || (_methods & CollectionMethod.CertServices) != 0) {
+            if (_methods.HasFlag(CollectionMethod.Container) || _methods.HasFlag(CollectionMethod.CertServices)) {
                 if (await _containerProcessor.GetContainingObject(entry) is (true, var container)) {
                     ret.ContainedBy = container;
                 }
             }
 
-            if ((_methods & CollectionMethod.CARegistry) != 0) {
+            if (_methods.HasFlag(CollectionMethod.CertServices)) {
+                var caName = entry.GetProperty(LDAPProperties.Name);
+                var dnsHostName = entry.GetProperty(LDAPProperties.DNSHostName);
+
+                if (caName != null && dnsHostName != null) {
+                    var caEnrollmentProcessor = new CAEnrollmentProcessor(dnsHostName, caName, _log);
+                    var ntlmEndpoints = await caEnrollmentProcessor.ScanAsync();
+                    ret.HttpEnrollmentEndpoints = ntlmEndpoints.ToArray();
+                } else {
+                    _log.LogWarning("The CA name or dnsHostname properties are null.");
+                }
+            }
+
+            if (_methods.HasFlag(CollectionMethod.CARegistry)) {
                 // Collect properties from CA server registry
                 var cASecurityCollected = false;
                 var enrollmentAgentRestrictionsCollected = false;
@@ -633,6 +716,8 @@ namespace Sharphound.Runtime {
                     isUserSpecifiesSanEnabledCollected = cARegistryData.IsUserSpecifiesSanEnabled.Collected;
                     roleSeparationEnabledCollected = cARegistryData.RoleSeparationEnabled.Collected;
                     ret.CARegistryData = cARegistryData;
+                } else {
+                    _log.LogWarning("The CA name or dnsHostname properties are null.");
                 }
 
                 ret.Properties.Add("casecuritycollected", cASecurityCollected);
@@ -653,15 +738,17 @@ namespace Sharphound.Runtime {
 
             ret.Properties = new Dictionary<string, object>(GetCommonProperties(entry, resolvedSearchResult));
 
-            if ((_methods & CollectionMethod.ACL) != 0 || (_methods & CollectionMethod.CertServices) != 0) {
-                (ret.Aces, bool doesAnyAceGrantOwnerRights, bool doesAnyInheritedAceGrantOwnerRights) = await _aclProcessor.ProcessACL(resolvedSearchResult, entry, true);
+            if (_methods.HasFlag(CollectionMethod.ACL) || _methods.HasFlag(CollectionMethod.CertServices)) {
+                var (aces, doesAnyAceGrantOwnerRights, doesAnyInheritedAceGrantOwnerRights) =
+                    await _aclProcessor.ProcessACL(resolvedSearchResult, entry, true);
                 ret.Properties.Add("doesanyacegrantownerrights", doesAnyAceGrantOwnerRights);
                 ret.Properties.Add("doesanyinheritedacegrantownerrights", doesAnyInheritedAceGrantOwnerRights);
+                ret.Aces = aces;
                 ret.IsACLProtected = _aclProcessor.IsACLProtected(entry);
                 ret.Properties.Add("isaclprotected", ret.IsACLProtected);
             }
 
-            if ((_methods & CollectionMethod.ObjectProps) != 0 || (_methods & CollectionMethod.CertServices) != 0) {
+            if (_methods.HasFlag(CollectionMethod.ObjectProps) || _methods.HasFlag(CollectionMethod.CertServices)) {
                 var props = LdapPropertyProcessor.ReadNTAuthStoreProperties(entry);
 
                 if (entry.TryGetByteArrayProperty(LDAPProperties.CACertificate, out var rawCertificates)) {
@@ -673,7 +760,7 @@ namespace Sharphound.Runtime {
                 ret.Properties.Merge(props);
             }
 
-            if ((_methods & CollectionMethod.Container) != 0 || (_methods & CollectionMethod.CertServices) != 0) {
+            if (_methods.HasFlag(CollectionMethod.Container) || _methods.HasFlag(CollectionMethod.CertServices)) {
                 if (await _containerProcessor.GetContainingObject(entry) is (true, var container)) {
                     ret.ContainedBy = container;
                 }
@@ -690,20 +777,22 @@ namespace Sharphound.Runtime {
 
             ret.Properties = new Dictionary<string, object>(GetCommonProperties(entry, resolvedSearchResult));
 
-            if ((_methods & CollectionMethod.ACL) != 0 || (_methods & CollectionMethod.CertServices) != 0) {
-                (ret.Aces, bool doesAnyAceGrantOwnerRights, bool doesAnyInheritedAceGrantOwnerRights) = await _aclProcessor.ProcessACL(resolvedSearchResult, entry, true);
+            if (_methods.HasFlag(CollectionMethod.ACL) || _methods.HasFlag(CollectionMethod.CertServices)) {
+                var (aces, doesAnyAceGrantOwnerRights, doesAnyInheritedAceGrantOwnerRights) =
+                    await _aclProcessor.ProcessACL(resolvedSearchResult, entry, true);
                 ret.Properties.Add("doesanyacegrantownerrights", doesAnyAceGrantOwnerRights);
                 ret.Properties.Add("doesanyinheritedacegrantownerrights", doesAnyInheritedAceGrantOwnerRights);
+                ret.Aces = aces;
                 ret.IsACLProtected = _aclProcessor.IsACLProtected(entry);
                 ret.Properties.Add("isaclprotected", ret.IsACLProtected);
             }
 
-            if ((_methods & CollectionMethod.ObjectProps) != 0 || (_methods & CollectionMethod.CertServices) != 0) {
+            if (_methods.HasFlag(CollectionMethod.ObjectProps) || _methods.HasFlag(CollectionMethod.CertServices)) {
                 var certTemplatesProps = LdapPropertyProcessor.ReadCertTemplateProperties(entry);
                 ret.Properties.Merge(certTemplatesProps);
             }
 
-            if ((_methods & CollectionMethod.Container) != 0 || (_methods & CollectionMethod.CertServices) != 0) {
+            if (_methods.HasFlag(CollectionMethod.Container) || _methods.HasFlag(CollectionMethod.CertServices)) {
                 if (await _containerProcessor.GetContainingObject(entry) is (true, var container)) {
                     ret.ContainedBy = container;
                 }
@@ -720,21 +809,23 @@ namespace Sharphound.Runtime {
 
             ret.Properties = new Dictionary<string, object>(GetCommonProperties(entry, resolvedSearchResult));
 
-            if ((_methods & CollectionMethod.ACL) != 0 || (_methods & CollectionMethod.CertServices) != 0) {
-                (ret.Aces, bool doesAnyAceGrantOwnerRights, bool doesAnyInheritedAceGrantOwnerRights) = await _aclProcessor.ProcessACL(resolvedSearchResult, entry, true);
+            if (_methods.HasFlag(CollectionMethod.ACL) || _methods.HasFlag(CollectionMethod.CertServices)) {
+                var (aces, doesAnyAceGrantOwnerRights, doesAnyInheritedAceGrantOwnerRights) =
+                    await _aclProcessor.ProcessACL(resolvedSearchResult, entry, true);
                 ret.Properties.Add("doesanyacegrantownerrights", doesAnyAceGrantOwnerRights);
                 ret.Properties.Add("doesanyinheritedacegrantownerrights", doesAnyInheritedAceGrantOwnerRights);
+                ret.Aces = aces;
                 ret.IsACLProtected = _aclProcessor.IsACLProtected(entry);
                 ret.Properties.Add("isaclprotected", ret.IsACLProtected);
             }
 
-            if ((_methods & CollectionMethod.ObjectProps) != 0 || (_methods & CollectionMethod.CertServices) != 0) {
+            if (_methods.HasFlag(CollectionMethod.ObjectProps) || _methods.HasFlag(CollectionMethod.CertServices)) {
                 var issuancePolicyProps = await _ldapPropertyProcessor.ReadIssuancePolicyProperties(entry);
                 ret.Properties.Merge(issuancePolicyProps.Props);
                 ret.GroupLink = issuancePolicyProps.GroupLink;
             }
 
-            if ((_methods & CollectionMethod.Container) != 0 || (_methods & CollectionMethod.CertServices) != 0) {
+            if (_methods.HasFlag(CollectionMethod.Container) || _methods.HasFlag(CollectionMethod.CertServices)) {
                 if (await _containerProcessor.GetContainingObject(entry) is (true, var container)) {
                     ret.ContainedBy = container;
                 }
