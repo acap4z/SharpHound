@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
@@ -15,6 +16,7 @@ using SharpHoundCommonLib.DirectoryObjects;
 using SharpHoundCommonLib.Enums;
 using SharpHoundCommonLib.OutputTypes;
 using SharpHoundCommonLib.Processors;
+using SharpHoundRPC.PortScanner;
 using Container = SharpHoundCommonLib.OutputTypes.Container;
 using Group = SharpHoundCommonLib.OutputTypes.Group;
 using Label = SharpHoundCommonLib.Enums.Label;
@@ -41,7 +43,7 @@ namespace Sharphound.Runtime {
         private readonly SPNProcessors _spnProcessor;
         private readonly WebClientServiceProcessor _webClientProcessor;
         private readonly SmbProcessor _smbProcessor;
-
+        private readonly ConcurrentDictionary<string, RegistryProcessor> _registryProcessorMap = new();
         public ObjectProcessors(IContext context, ILogger log) {
             _context = context;
             _aclProcessor = new ACLProcessor(context.LDAPUtils);
@@ -306,6 +308,17 @@ namespace Sharphound.Runtime {
                 ret.UserRights = await userRights.ToArrayAsync();
             }
 
+            if (_methods.HasFlag(CollectionMethod.NTLMRegistry)) {
+                await _context.DoDelay();
+                if (_registryProcessorMap.TryGetValue(resolvedSearchResult.DomainSid, out var processor)) {
+                    ret.RegistryData = await processor.ReadRegistrySettings(resolvedSearchResult.DisplayName);
+                } else {
+                    var newProcessor = new RegistryProcessor(null, resolvedSearchResult.Domain);
+                    _registryProcessorMap.TryAdd(resolvedSearchResult.DomainSid, newProcessor);
+                    ret.RegistryData = await newProcessor.ReadRegistrySettings(resolvedSearchResult.DisplayName);
+                }
+            }
+
             if (_methods.HasFlag(CollectionMethod.WebClientService)) {
                 ret.IsWebClientRunning = await _webClientProcessor.IsWebClientRunning(apiName);
             }
@@ -353,6 +366,7 @@ namespace Sharphound.Runtime {
             _log.LogDebug("Processing DC: {dc}", apiName);
 
             if (_methods.HasFlag(CollectionMethod.DCRegistry)) {
+                await _context.DoDelay();
                 DCRegistryData dCRegistryData = new() {
                     CertificateMappingMethods = _dcRegistryProcessor.GetCertificateMappingMethods(apiName),
                     StrongCertificateBindingEnforcement =
@@ -364,7 +378,16 @@ namespace Sharphound.Runtime {
 
             if (_methods.HasFlag(CollectionMethod.LdapServices)) {
                 var dcLdapProcessor = new DCLdapProcessor(_context.PortScanTimeout, apiName, _log);
-                ret.LdapServices = await dcLdapProcessor.Scan();
+                var ldapServices = await dcLdapProcessor.Scan();
+                ret.Properties.Add("ldapenabled", ldapServices.HasLdap);
+                ret.Properties.Add("ldapsenabled", ldapServices.HasLdaps);
+                if (ldapServices.IsChannelBindingDisabled.Collected) {
+                    ret.Properties.Add("ldapsepa", ldapServices.IsChannelBindingDisabled);    
+                }
+
+                if (ldapServices.IsSigningRequired.Collected) {
+                    ret.Properties.Add("ldapsigning", ldapServices.IsSigningRequired);    
+                }
             }
         }
 
